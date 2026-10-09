@@ -1,0 +1,57 @@
+#!/bin/sh
+# bell-admz-verify.sh - read-only snapshot of WAN, routes, and service stability.
+# Run before and after a lease cycle and compare process elapsed times.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+IF=ix0
+sec() { echo; echo "=== $* ==="; }
+run() { echo "\$ $*"; "$@" 2>&1; }
+
+sec "WAN address and mask"
+run /sbin/ifconfig $IF inet
+
+sec "Default gateway"
+run /sbin/route -n get default
+GW=$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '$1=="gateway:"{print $2; exit}')
+SRV=$(/usr/bin/awk '$1=="option" && $2=="dhcp-server-identifier"{s=$3; gsub(";","",s); v=s} END{print v}' /var/db/dhclient.leases.$IF 2>/dev/null)
+MON=$(/bin/ps -axww -o command= | /usr/bin/awk '/dpinger/ && /-B /{print $NF; exit}')
+echo "gateway=$GW dhcp-server=$SRV monitor=$MON"
+
+sec "Route to DHCP server"
+[ -n "$SRV" ] && run /sbin/route -n get "$SRV"
+
+sec "Route to Bell next hop"
+[ -n "$GW" ] && run /sbin/route -n get "$GW"
+
+sec "Route to dpinger monitor"
+[ -n "$MON" ] && run /sbin/route -n get "$MON"
+
+sec "Native state files"
+for f in /tmp/${IF}_router /tmp/${IF}_defaultgw /var/db/${IF}_ip; do printf '%s: ' "$f"; cat "$f" 2>/dev/null || echo "(absent)"; echo; done
+
+sec "dpinger / unbound / named (elapsed time should keep growing across cycles)"
+/bin/ps -axww -o pid,etime,command | /usr/bin/grep -E '[d]pinger|[u]nbound|[n]amed'
+
+sec "gif0 (HE IPv6)"
+run /sbin/ifconfig gif0
+
+sec "Firewall reload and rc.newwanip counters in system.log"
+echo "Reloading filter: $(/usr/bin/grep -c 'Reloading filter' /var/log/system.log 2>/dev/null)"
+echo "rc.newwanip ix0:  $(/usr/bin/grep -c 'rc.newwanip starting ix0' /var/log/system.log 2>/dev/null)"
+echo "gif0 DOWN events: $(/usr/bin/grep -c 'gif0: link state changed to DOWN' /var/log/system.log 2>/dev/null)"
+
+sec "Shim decisions (last 20)"
+/usr/bin/grep -E 'DEFERRED|UNCHANGED|normal path|teardown|DRYRUN|watchdog' /var/log/bell-admz.log 2>/dev/null | /usr/bin/tail -n 20
+
+sec "IPsec"
+if [ -x /usr/local/sbin/swanctl ]; then run /usr/local/sbin/swanctl --list-sas; else echo "swanctl not found"; fi
+
+sec "BGP / FRR"
+VT=$(command -v vtysh)
+if [ -n "$VT" ]; then run "$VT" -c 'show bgp summary'; else echo "vtysh not found"; fi
+
+sec "WireGuard"
+WG=$(command -v wg)
+if [ -n "$WG" ]; then run "$WG" show; else echo "wg not found"; fi
+
+sec "Shim status"
+[ -x /usr/local/libexec/bell-admz-shim.sh ] && /usr/local/libexec/bell-admz-shim.sh status

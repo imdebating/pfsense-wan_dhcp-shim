@@ -1,0 +1,4 @@
+54f35e028474e71b4128b992dbc0b0cbfe0e8503e3ac261af09d8d86e1bdcc8a  bell-admz-observe.sh
+468f9e69f180fe39c2e6841fe53f56b7511b31efd37defb366275b8a4de5d705  bell-admz-install.sh
+b49162da773812ef403fb1f0e89f98cfdf7d234a5f257b51f43516b8f6d5a463  bell-admz-uninstall.sh
+024d3dcdeff958800c6d99e5215b4fd46390b80b8db0ec74d4464faa135d5fef  bell-admz-readonly.sh

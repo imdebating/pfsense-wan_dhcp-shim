@@ -1,0 +1,299 @@
+#!/bin/sh
+#
+# bell-admz-shield -- Bell Advanced DMZ DHCP continuity hook
+# for pfSense CE 2.8.1-RELEASE ("tardis", WAN ix0).
+#
+# THIS FILE IS SOURCED BY /usr/local/sbin/pfSense-dhclient-script via
+# the symlink /etc/dhclient-enter-hooks.  It is NEVER executed directly.
+# The stock script sources it before acting on $reason:
+#
+#     exit_status=0
+#     if [ -f /etc/dhclient-enter-hooks ]; then
+#         . /etc/dhclient-enter-hooks
+#         # local script must set exit_status variable to nonzero.
+#         if [ $exit_status -ne 0 ]; then
+#             exit $exit_status
+#         fi
+#     fi
+#
+# ABORT MECHANISM (verified against the installed 2.8.1 script): set
+# the shell variable exit_status to nonzero.  The hook's own return
+# status is ignored.  The stock script exits immediately with that
+# value, skipping all address, route, resolv, and
+# 'pfSctl -c "interface newip"' processing for the event.
+#
+# exit_status values used here:
+#   (untouched/0) : run normal pfSense processing (fail-open default)
+#   2             : event absorbed (no teardown, no rebuild, no notify)
+#
+# Events handled (all other reasons pass straight through):
+#   EXPIRE   - retain address and routes when live state matches record
+#   PREINIT  - skip interface reset and the /tmp/$IFACE_router rename
+#              while the recorded address is still live
+#   BOUND/RENEW/REBIND/REBOOT - suppress rebuild and notification only
+#              on an exact match of ip, mask, broadcast, gateway, DHCP
+#              server identifier, dns servers, and classless routes
+#
+# Fail-open rules: no previous state, changed lease, recorded address
+# not live, default-route mismatch, DHCP-server route mismatch, monitor
+# route mismatch, lock contention, malformed lease data, or unknown
+# mode all take the normal stock path.  The first event after install
+# or reboot always takes the normal path (state is learned, not acted
+# on) because the recorded address is never live on the interface
+# before the first successful binding.
+#
+# Deliberate omissions:
+#   - lease time is NOT compared: a timer change alone does not alter
+#     effective WAN state, so absorbing it is correct;
+#   - FAIL, RELEASE, TIMEOUT, NAK handling is left entirely to stock
+#     pfSense so manual release/renew and genuine outages behave
+#     exactly as without this hook.
+#
+# No hard-coded IPs, gateways, masks, or servers.  No eval.  POSIX sh
+# and BSD userland only.  Never invokes dhclient-script, dhclient, or
+# pfSctl, so recursion is structurally impossible.  Never edits a
+# generated pfSense file.
+
+BELL_ADMZ_IFACE=
+BELL_ADMZ_MODE=disabled
+BELL_ADMZ_ENABLED=0
+BELL_ADMZ_MONITORS=
+if [ -r /conf/bell-admz-shield/config ]; then
+	. /conf/bell-admz-shield/config
+fi
+
+bamz_logger() {
+	/usr/bin/logger -t bell-admz "$1" 2>/dev/null
+	return 0
+}
+
+# ---- relevance gates: any failure falls through to stock behaviour ----
+
+[ "${BELL_ADMZ_ENABLED:-0}" = "1" ] || return 0
+case "${BELL_ADMZ_MODE}" in
+	retain|dryrun) ;;
+	*) return 0 ;;
+esac
+case "${reason:-}" in
+	EXPIRE|PREINIT|BOUND|RENEW|REBIND|REBOOT) ;;
+	*) return 0 ;;
+esac
+[ "${interface:-}" = "${BELL_ADMZ_IFACE}" ] || return 0
+
+# IPv4 only; reject missing or malformed v4 fields on BOUND-class events.
+case "$reason" in
+	BOUND|RENEW|REBIND|REBOOT)
+		case "${new_ip_address:-}" in
+			""|*[!0-9.]*)
+				bamz_logger "$reason on $interface: malformed new_ip_address; fail-open"
+				return 0
+				;;
+		esac
+		case "${new_subnet_mask:-}" in
+			""|*[!0-9.]*)
+				bamz_logger "$reason: malformed new_subnet_mask; fail-open"
+				return 0
+				;;
+		esac
+		case "${new_routers:-}" in
+			"")
+				bamz_logger "$reason: no new_routers; fail-open"
+				return 0
+				;;
+		esac
+		;;
+esac
+
+# ---- lock: mkdir-based (POSIX-safe), bounded, stale-safe ----
+
+BAMZ_RUN=/var/run/bell-admz
+BAMZ_LOCK=$BAMZ_RUN/lock
+BAMZ_STATE=$BAMZ_RUN/state
+
+if ! /bin/mkdir -p "$BAMZ_RUN" 2>/dev/null; then
+	bamz_logger "cannot create $BAMZ_RUN; fail-open"
+	return 0
+fi
+
+BAMZ_TRIES=0
+while ! /bin/mkdir "$BAMZ_LOCK" 2>/dev/null; do
+	BAMZ_TRIES=$((BAMZ_TRIES + 1))
+	if [ "$BAMZ_TRIES" -ge 4 ]; then
+		bamz_logger "lock busy after 4s ($reason); fail-open"
+		return 0
+	fi
+	BAMZ_NOW=$(/bin/date +%s)
+	BAMZ_MTIME=$(/usr/bin/stat -f %m "$BAMZ_LOCK" 2>/dev/null || /bin/echo "$BAMZ_NOW")
+	if [ $((BAMZ_NOW - BAMZ_MTIME)) -gt 60 ]; then
+		bamz_logger "removing stale lock"
+		/bin/rmdir "$BAMZ_LOCK" 2>/dev/null
+	fi
+	/bin/sleep 1
+done
+
+# ---- snapshot live state (used for every decision) ----
+
+BAMZ_IFC_OUT=$(/sbin/ifconfig "$BELL_ADMZ_IFACE" inet 2>/dev/null)
+BAMZ_LIVE_ADDR=$(printf '%s\n' "$BAMZ_IFC_OUT" | /usr/bin/awk '/inet /{print $2; exit}')
+BAMZ_LIVE_MASK=$(printf '%s\n' "$BAMZ_IFC_OUT" | /usr/bin/awk '/inet /{print $4; exit}')
+BAMZ_RT_OUT=$(/sbin/route -n get default 2>/dev/null)
+BAMZ_DEF_GW=$(printf '%s\n' "$BAMZ_RT_OUT" | /usr/bin/awk '/gateway:/{print $2; exit}')
+BAMZ_DEF_IF=$(printf '%s\n' "$BAMZ_RT_OUT" | /usr/bin/awk '/interface:/{print $2; exit}')
+
+bamz_route_if() {
+	/sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}'
+}
+
+# ---- read previous state (no eval; awk extraction is injection-safe) ----
+
+BAMZ_S_OK=0
+BAMZ_S_IP= ; BAMZ_S_MASK= ; BAMZ_S_BCAST= ; BAMZ_S_GW= ; BAMZ_S_SID= ; BAMZ_S_DNS= ; BAMZ_S_CLS=
+if [ -r "$BAMZ_STATE" ]; then
+	BAMZ_S_IP=$(/usr/bin/awk -F= '$1=="ip"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_MASK=$(/usr/bin/awk -F= '$1=="mask"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_BCAST=$(/usr/bin/awk -F= '$1=="bcast"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_GW=$(/usr/bin/awk -F= '$1=="gw"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_SID=$(/usr/bin/awk -F= '$1=="sid"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_DNS=$(/usr/bin/awk -F= '$1=="dns"{print $2; exit}' "$BAMZ_STATE")
+	BAMZ_S_CLS=$(/usr/bin/awk -F= '$1=="cls"{print $2; exit}' "$BAMZ_STATE")
+	[ -n "$BAMZ_S_IP" ] && [ -n "$BAMZ_S_MASK" ] && [ -n "$BAMZ_S_GW" ] && BAMZ_S_OK=1
+fi
+
+# ---- new lease fields ----
+
+BAMZ_N_IP=${new_ip_address:-}
+BAMZ_N_MASK=${new_subnet_mask:-}
+BAMZ_N_BCAST=${new_broadcast_address:-}
+BAMZ_N_SID=${new_dhcp_server_identifier:-}
+BAMZ_N_DNS=${new_domain_name_servers:-}
+BAMZ_N_CLS=${new_classless_routes:-}
+BAMZ_N_GW=
+for BAMZ_R in ${new_routers:-}; do
+	BAMZ_N_GW="$BAMZ_R"
+	break
+done
+
+bamz_state_write() {
+	BAMZ_TMP="$BAMZ_STATE.tmp.$$"
+	if {
+		printf 'iface=%s\n' "$BELL_ADMZ_IFACE"
+		printf 'ip=%s\n' "$BAMZ_N_IP"
+		printf 'mask=%s\n' "$BAMZ_N_MASK"
+		printf 'bcast=%s\n' "$BAMZ_N_BCAST"
+		printf 'gw=%s\n' "$BAMZ_N_GW"
+		printf 'sid=%s\n' "$BAMZ_N_SID"
+		printf 'dns=%s\n' "$BAMZ_N_DNS"
+		printf 'cls=%s\n' "$BAMZ_N_CLS"
+	} > "$BAMZ_TMP"; then
+		/bin/chmod 600 "$BAMZ_TMP" 2>/dev/null
+		if /bin/mv "$BAMZ_TMP" "$BAMZ_STATE"; then
+			return 0
+		fi
+		/bin/rm -f "$BAMZ_TMP" 2>/dev/null
+	else
+		/bin/rm -f "$BAMZ_TMP" 2>/dev/null
+	fi
+	# a failed write could leave a stale record; drop it so the next
+	# event fails open and re-learns
+	bamz_logger "state write failed; dropping state, next event fails open"
+	/bin/rm -f "$BAMZ_STATE" 2>/dev/null
+	return 0
+}
+
+bamz_mon_ok() {
+	for BAMZ_M in ${BELL_ADMZ_MONITORS:-}; do
+		if [ "$(bamz_route_if "$BAMZ_M")" != "$BELL_ADMZ_IFACE" ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+# ---- decision: absorb only by setting exit_status=2 ----
+
+case "$reason" in
+EXPIRE)
+	if [ "$BAMZ_S_OK" = 0 ]; then
+		bamz_logger "EXPIRE: no usable previous state; normal path"
+	elif [ -n "${old_ip_address:-}" ] && [ "${old_ip_address}" != "$BAMZ_S_IP" ]; then
+		bamz_logger "EXPIRE: old lease ${old_ip_address} != recorded ${BAMZ_S_IP}; normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	elif [ "$BAMZ_LIVE_ADDR" = "$BAMZ_S_IP" ] && [ "$BAMZ_LIVE_MASK" = "$BAMZ_S_MASK" ] \
+		&& [ "$BAMZ_DEF_GW" = "$BAMZ_S_GW" ] && [ "$BAMZ_DEF_IF" = "$BELL_ADMZ_IFACE" ] \
+		&& bamz_mon_ok; then
+		if [ "$BELL_ADMZ_MODE" = dryrun ]; then
+			bamz_logger "dryrun EXPIRE: would retain ${BAMZ_S_IP}/${BAMZ_S_MASK} gw ${BAMZ_S_GW} and routes"
+		else
+			bamz_logger "EXPIRE: retaining ${BAMZ_S_IP}/${BAMZ_S_MASK} gw ${BAMZ_S_GW} and routes"
+			exit_status=2
+		fi
+	else
+		bamz_logger "EXPIRE: live ${BAMZ_LIVE_ADDR:-none}/${BAMZ_LIVE_MASK:-none} gw ${BAMZ_DEF_GW:-none}@${BAMZ_DEF_IF:-none} != record; normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	fi
+	;;
+PREINIT)
+	# stock PREINIT does not zero the address; it deletes the alias,
+	# brings the interface up, and renames /tmp/$IFACE_router to .last.
+	# Suppressing it keeps the router file intact for pfSense code that
+	# reads /tmp/$IFACE_router while the subsequent BOUND is absorbed.
+	if [ "$BAMZ_S_OK" = 1 ] && [ "$BAMZ_LIVE_ADDR" = "$BAMZ_S_IP" ] \
+		&& [ "$BAMZ_LIVE_MASK" = "$BAMZ_S_MASK" ]; then
+		if [ "$BELL_ADMZ_MODE" = dryrun ]; then
+			bamz_logger "dryrun PREINIT: would skip interface reset and router-file rename for ${BAMZ_S_IP}"
+		else
+			bamz_logger "PREINIT: skipping interface reset and router-file rename for ${BAMZ_S_IP}"
+			exit_status=2
+		fi
+	else
+		bamz_logger "PREINIT: no matching state or address absent; normal path"
+	fi
+	;;
+BOUND|RENEW|REBIND|REBOOT)
+	if [ -z "$BAMZ_N_MASK" ] || [ -z "$BAMZ_N_GW" ]; then
+		bamz_logger "$reason: incomplete lease data; fail-open"
+	elif [ "$BAMZ_S_OK" = 0 ]; then
+		bamz_logger "$reason: learning ${BAMZ_N_IP}/${BAMZ_N_MASK} gw ${BAMZ_N_GW} sid ${BAMZ_N_SID:-unknown}; normal path"
+		bamz_state_write
+	elif [ "$BAMZ_N_IP" != "$BAMZ_S_IP" ] || [ "$BAMZ_N_MASK" != "$BAMZ_S_MASK" ] \
+		|| [ "$BAMZ_N_GW" != "$BAMZ_S_GW" ] || [ "$BAMZ_N_SID" != "$BAMZ_S_SID" ] \
+		|| [ "$BAMZ_N_BCAST" != "$BAMZ_S_BCAST" ] || [ "$BAMZ_N_DNS" != "$BAMZ_S_DNS" ] \
+		|| [ "$BAMZ_N_CLS" != "$BAMZ_S_CLS" ]; then
+		bamz_logger "$reason: lease changed (ip ${BAMZ_S_IP} -> ${BAMZ_N_IP}, mask ${BAMZ_S_MASK} -> ${BAMZ_N_MASK}, gw ${BAMZ_S_GW} -> ${BAMZ_N_GW}, sid ${BAMZ_S_SID:-none} -> ${BAMZ_N_SID:-none}); normal path"
+		bamz_state_write
+	elif [ "$BAMZ_LIVE_ADDR" != "$BAMZ_S_IP" ] || [ "$BAMZ_LIVE_MASK" != "$BAMZ_S_MASK" ]; then
+		bamz_logger "$reason: recorded address not live (${BAMZ_LIVE_ADDR:-none}/${BAMZ_LIVE_MASK:-none}); normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	elif [ "$BAMZ_DEF_GW" != "$BAMZ_S_GW" ] || [ "$BAMZ_DEF_IF" != "$BELL_ADMZ_IFACE" ]; then
+		bamz_logger "$reason: default route ${BAMZ_DEF_GW:-none}@${BAMZ_DEF_IF:-none} != ${BAMZ_S_GW}@$BELL_ADMZ_IFACE; normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	elif [ -n "$BAMZ_N_SID" ] && [ "$(bamz_route_if "$BAMZ_N_SID")" != "$BELL_ADMZ_IFACE" ]; then
+		bamz_logger "$reason: DHCP server ${BAMZ_N_SID} not routed via $BELL_ADMZ_IFACE; normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	elif ! bamz_mon_ok; then
+		bamz_logger "$reason: monitor route check failed; normal path"
+		/bin/rm -f "$BAMZ_STATE"
+	else
+		if [ "$BELL_ADMZ_MODE" = dryrun ]; then
+			bamz_logger "dryrun $reason: unchanged lease ${BAMZ_N_IP}/${BAMZ_N_MASK} gw ${BAMZ_N_GW}; would suppress rebuild"
+		else
+			bamz_logger "$reason: unchanged lease ${BAMZ_N_IP}/${BAMZ_N_MASK} gw ${BAMZ_N_GW} sid ${BAMZ_N_SID:-unknown}; suppressing rebuild and newip notification"
+			exit_status=2
+		fi
+	fi
+	;;
+esac
+
+/bin/rmdir "$BAMZ_LOCK" 2>/dev/null
+
+# We are sourced: do not leak variables into dhclient-script.
+# exit_status is deliberately NOT unset -- the stock script checks it
+# immediately after this file returns.
+unset bamz_logger bamz_route_if bamz_state_write bamz_mon_ok
+unset BAMZ_RUN BAMZ_LOCK BAMZ_STATE BAMZ_TRIES BAMZ_NOW BAMZ_MTIME BAMZ_TMP BAMZ_M BAMZ_R
+unset BAMZ_IFC_OUT BAMZ_LIVE_ADDR BAMZ_LIVE_MASK BAMZ_RT_OUT BAMZ_DEF_GW BAMZ_DEF_IF
+unset BAMZ_S_OK BAMZ_S_IP BAMZ_S_MASK BAMZ_S_BCAST BAMZ_S_GW BAMZ_S_SID BAMZ_S_DNS BAMZ_S_CLS
+unset BAMZ_N_IP BAMZ_N_MASK BAMZ_N_BCAST BAMZ_N_SID BAMZ_N_DNS BAMZ_N_CLS BAMZ_N_GW
+unset BELL_ADMZ_IFACE BELL_ADMZ_MODE BELL_ADMZ_ENABLED BELL_ADMZ_MONITORS
+
+return 0

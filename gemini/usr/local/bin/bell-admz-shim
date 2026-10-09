@@ -1,0 +1,187 @@
+#!/bin/sh
+# /usr/local/bin/bell-admz-shim.sh
+# Scoped DHCP Continuity Engine for Bell ADMZ on pfSense (FreeBSD /bin/sh)
+
+set -u
+
+TARGET_IFACE="ix0"
+EXPECTED_DHCP_SERVER="192.168.2.1"
+STATE_DIR="/var/run/bell_admz"
+STATE_FILE="${STATE_DIR}/state_${TARGET_IFACE}"
+LOCK_DIR="${STATE_DIR}/lock_${TARGET_IFACE}"
+LOG_TAG="bell-admz-shim"
+
+PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+export PATH
+
+log_msg() {
+    /usr/bin/logger -t "${LOG_TAG}" "[$$] $1"
+}
+
+fail_open() {
+    log_msg "FAIL-OPEN: $1. Permitting native pfSense processing."
+    rm -rf "${LOCK_DIR}" 2>/dev/null
+    exit_status=0
+    return 0
+}
+
+# 1. Scope Enforcement: Interface must match target
+if [ "${interface:-}" != "${TARGET_IFACE}" ]; then
+    return 0
+fi
+
+# 2. Acquire Atomic Directory Lock (bounded timeout)
+mkdir -p "${STATE_DIR}" 2>/dev/null
+LOCK_ATTEMPTS=0
+while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+    LOCK_ATTEMPTS=$((LOCK_ATTEMPTS + 1))
+    if [ "${LOCK_ATTEMPTS}" -gt 10 ]; then
+        fail_open "Lock acquisition timed out on ${LOCK_DIR}"
+        return 0
+    fi
+    sleep 1
+done
+
+trap 'rm -rf "${LOCK_DIR}" 2>/dev/null' EXIT INT TERM
+
+# 3. State Evaluation per DHCP Event
+case "${reason:-}" in
+    EXPIRE)
+        if [ ! -f "${STATE_FILE}" ]; then
+            fail_open "No cached state file found during EXPIRE"
+            return 0
+        fi
+
+        . "${STATE_FILE}"
+
+        # Inspect live kernel state
+        LIVE_IP=$(/sbin/ifconfig "${TARGET_IFACE}" inet 2>/dev/null | /usr/bin/awk '/inet / {print $2}')
+        LIVE_GW=$(/usr/bin/netstat -rn -f inet 2>/dev/null | /usr/bin/awk '$1 == "default" && $4 ~ /G/ {print $2; exit}')
+
+        if [ -n "${LIVE_IP}" ] && [ "${LIVE_IP}" = "${CACHED_IP:-}" ] && \
+           [ -n "${LIVE_GW}" ] && [ "${LIVE_GW}" = "${CACHED_GW:-}" ]; then
+            log_msg "EXPIRE intercepted on ${TARGET_IFACE}: retaining IP ${LIVE_IP} and gateway ${LIVE_GW}."
+            echo "PHASE=EXPIRE_SUPPRESSED" >> "${STATE_FILE}"
+            echo "EXPIRE_TIMESTAMP=$(/bin/date +%s)" >> "${STATE_FILE}"
+            
+            # Setting exit_status=1 aborts pfSense-dhclient-script at line 223,
+            # preventing delete_old_address and delete_old_routes from executing.
+            exit_status=1
+            return 1
+        fi
+
+        fail_open "Kernel state differs from cache during EXPIRE"
+        return 0
+        ;;
+
+    PREINIT)
+        if [ -f "${STATE_FILE}" ]; then
+            EXPIRE_TS=$(/usr/bin/awk -F'=' '$1 == "EXPIRE_TIMESTAMP" {print $2}' "${STATE_FILE}" 2>/dev/null | /usr/bin/tail -n 1)
+            NOW=$(/bin/date +%s)
+            DIFF=$((NOW - ${EXPIRE_TS:-0}))
+
+            # Suppress PREINIT rotation only if preceded by an EXPIRE within 60s
+            if [ "${DIFF}" -ge 0 ] && [ "${DIFF}" -le 60 ]; then
+                log_msg "PREINIT intercepted on ${TARGET_IFACE}: preserving interface configuration."
+                exit_status=1
+                return 1
+            fi
+        fi
+        return 0
+        ;;
+
+    BOUND|RENEW|REBIND|REBOOT)
+        NEW_IP="${new_ip_address:-}"
+        NEW_MASK="${new_subnet_mask:-}"
+        NEW_GW="${new_routers:-}"
+        NEW_DHCP="${new_dhcp_server_identifier:-${EXPECTED_DHCP_SERVER}}"
+
+        if [ -z "${NEW_IP}" ] || [ -z "${NEW_MASK}" ] || [ -z "${NEW_GW}" ]; then
+            fail_open "Incomplete DHCP parameters received"
+            return 0
+        fi
+
+        # Inspect live kernel state
+        LIVE_IP=$(/sbin/ifconfig "${TARGET_IFACE}" inet 2>/dev/null | /usr/bin/awk '/inet / {print $2}')
+        LIVE_HEXMASK=$(/sbin/ifconfig "${TARGET_IFACE}" inet 2>/dev/null | /usr/bin/awk '/inet / {print $4}')
+        LIVE_GW=$(/usr/bin/netstat -rn -f inet 2>/dev/null | /usr/bin/awk '$1 == "default" && $4 ~ /G/ {print $2; exit}')
+
+        # Convert hex netmask to dotted decimal
+        LIVE_MASK=""
+        if [ -n "${LIVE_HEXMASK}" ]; then
+            LIVE_MASK=$(/usr/bin/printf "%d.%d.%d.%d\n" \
+                "$((${LIVE_HEXMASK} >> 24 & 255))" \
+                "$((${LIVE_HEXMASK} >> 16 & 255))" \
+                "$((${LIVE_HEXMASK} >> 8 & 255))" \
+                "$((${LIVE_HEXMASK} & 255))")
+        fi
+
+        # Baseline lease check
+        if [ ! -f "${STATE_FILE}" ]; then
+            log_msg "First lease initialization for ${TARGET_IFACE}. Caching baseline state."
+            cat <<EOF > "${STATE_FILE}"
+CACHED_IFACE="${TARGET_IFACE}"
+CACHED_IP="${NEW_IP}"
+CACHED_MASK="${NEW_MASK}"
+CACHED_GW="${NEW_GW}"
+CACHED_DHCP="${NEW_DHCP}"
+LAST_SEEN="$(/bin/date +%s)"
+EOF
+            return 0
+        fi
+
+        . "${STATE_FILE}"
+
+        # Multi-Field Comparison Check
+        MISMATCH=""
+        [ "${NEW_IP}" != "${CACHED_IP:-}" ] && MISMATCH="${MISMATCH} IP(${CACHED_IP}->${NEW_IP})"
+        [ "${NEW_IP}" != "${LIVE_IP:-}" ] && MISMATCH="${MISMATCH} KernelIP(${LIVE_IP}->${NEW_IP})"
+        [ "${NEW_MASK}" != "${CACHED_MASK:-}" ] && MISMATCH="${MISMATCH} Mask(${CACHED_MASK}->${NEW_MASK})"
+        [ "${NEW_MASK}" != "${LIVE_MASK:-}" ] && MISMATCH="${MISMATCH} KernelMask(${LIVE_MASK}->${NEW_MASK})"
+        [ "${NEW_GW}" != "${CACHED_GW:-}" ] && MISMATCH="${MISMATCH} GW(${CACHED_GW}->${NEW_GW})"
+        [ "${NEW_GW}" != "${LIVE_GW:-}" ] && MISMATCH="${MISMATCH} KernelGW(${LIVE_GW}->${NEW_GW})"
+        [ "${NEW_DHCP}" != "${CACHED_DHCP:-}" ] && MISMATCH="${MISMATCH} DHCPServer(${CACHED_DHCP}->${NEW_DHCP})"
+
+        # Verify kernel default route egresses through TARGET_IFACE
+        ROUTE_IFACE=$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/interface:/ {print $2}')
+        if [ "${ROUTE_IFACE}" != "${TARGET_IFACE}" ]; then
+            MISMATCH="${MISMATCH} DefaultRouteIface(${ROUTE_IFACE:-none}->${TARGET_IFACE})"
+        fi
+
+        if [ -n "${MISMATCH}" ]; then
+            log_msg "State change detected:${MISMATCH}. Triggering native pfSense reconfiguration."
+            cat <<EOF > "${STATE_FILE}"
+CACHED_IFACE="${TARGET_IFACE}"
+CACHED_IP="${NEW_IP}"
+CACHED_MASK="${NEW_MASK}"
+CACHED_GW="${NEW_GW}"
+CACHED_DHCP="${NEW_DHCP}"
+LAST_SEEN="$(/bin/date +%s)"
+EOF
+            return 0
+        fi
+
+        # State is identical: refresh pfSense tracking files
+        echo "$NEW_GW" > "/tmp/${TARGET_IFACE}_router"
+        /bin/rm -f "/tmp/${TARGET_IFACE}_router.last"
+        echo "$NEW_IP" > "/var/db/${TARGET_IFACE}_ip"
+
+        log_msg "Unchanged WAN state confirmed for ${TARGET_IFACE} (${NEW_IP}, GW ${NEW_GW}). Suppressing rc.newwanip."
+        echo "LAST_SEEN=\"$(/bin/date +%s)\"" >> "${STATE_FILE}"
+
+        # Exit entire dhclient-script directly (status 0).
+        # Bypasses add_new_address, add_new_routes, and notify_rc_newwanip.
+        rm -rf "${LOCK_DIR}" 2>/dev/null
+        exit 0
+        ;;
+
+    FAIL|RELEASE)
+        log_msg "DHCP event ${reason} on ${TARGET_IFACE}. Permitting native teardown."
+        rm -f "${STATE_FILE}" 2>/dev/null
+        return 0
+        ;;
+
+    *)
+        return 0
+        ;;
+esac

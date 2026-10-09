@@ -1,0 +1,9 @@
+#!/bin/sh
+# /etc/dhclient-enter-hooks
+# Sourced inline by /usr/local/sbin/pfSense-dhclient-script at line 219
+
+SHIM="/usr/local/bin/bell-admz-shim.sh"
+
+if [ -f "${SHIM}" ] && [ -x "${SHIM}" ]; then
+    . "${SHIM}"
+fi

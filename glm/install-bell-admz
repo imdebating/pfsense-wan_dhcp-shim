@@ -1,0 +1,132 @@
+#!/bin/sh
+# install-bell-admz.sh -- installer for the Bell ADMZ DHCP continuity
+# shim on pfSense CE 2.8.1-RELEASE.
+#
+# Usage:
+#   ./install-bell-admz.sh -i ix0 [-m dryrun|retain] [-s "1.1.1.1"] \
+#                          [--dry-run] [--force-version]
+#
+# -m  hook mode; dryrun (default) logs decisions only, retain absorbs
+# -s  optional space-separated dpinger monitor IPs to verify routing for
+# --dry-run       print the actions that would be taken and exit
+# --force-version proceed on an untested pfSense version, after review
+#
+# The installer never reloads an interface, never restarts a service,
+# and never modifies a pfSense-managed file.  Default mode is dryrun;
+# switch to retain only after observing at least one full lease cycle
+# (600 s on this Bell handoff) of correct dryrun decisions, with
+# console or out-of-band access available.
+
+IFACE=
+MODE=dryrun
+MONITORS=
+DRYRUN=0
+FORCE=0
+CONFDIR=/conf/bell-admz-shield
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+say()  { printf '%s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-i) [ $# -ge 2 ] || die "-i needs an argument"; IFACE=$2; shift 2 ;;
+		-m) [ $# -ge 2 ] || die "-m needs an argument"; MODE=$2; shift 2 ;;
+		-s) [ $# -ge 2 ] || die "-s needs an argument"; MONITORS=$2; shift 2 ;;
+		--dry-run) DRYRUN=1; shift ;;
+		--force-version) FORCE=1; shift ;;
+		*) die "unknown option: $1" ;;
+	esac
+done
+
+[ "$(id -u)" = 0 ] || die "run as root on pfSense"
+[ -n "$IFACE" ] || die "usage: install-bell-admz.sh -i <iface> [-m dryrun|retain] [-s monitors]"
+case "$MODE" in
+	dryrun|retain) ;;
+	*) die "mode must be dryrun or retain" ;;
+esac
+[ -r /etc/version ] || die "this is not a pfSense system"
+VERSION=$(/bin/cat /etc/version)
+if [ "$VERSION" != "2.8.1-RELEASE" ] && [ "$FORCE" != 1 ]; then
+	die "untested pfSense version '$VERSION' (tested: 2.8.1-RELEASE); review, then use --force-version"
+fi
+
+DHS=/usr/local/sbin/pfSense-dhclient-script
+[ -r "$DHS" ] || die "$DHS not found"
+/usr/bin/grep -q '/etc/dhclient-enter-hooks' "$DHS" || \
+	die "stock script does not source /etc/dhclient-enter-hooks; do NOT proceed"
+/usr/bin/grep -A6 'dhclient-enter-hooks' "$DHS" | /usr/bin/grep -q 'exit_status' || \
+	die "enter hook lacks abort-on-exit_status semantics; do NOT proceed"
+/usr/bin/grep -q 'EXPIRE' "$DHS" || die "unexpected event layout in stock script"
+/sbin/ifconfig "$IFACE" >/dev/null 2>&1 || die "interface $IFACE does not exist"
+[ -r "/var/db/dhclient.leases.$IFACE" ] || \
+	die "no dhclient lease file for $IFACE; is the WAN on $IFACE configured for DHCP?"
+pgrep -f "dhclient.*leases.$IFACE" >/dev/null 2>&1 || \
+	die "no dhclient running for $IFACE"
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ -r "$SCRIPT_DIR/dhclient-enter-hooks" ] || die "missing $SCRIPT_DIR/dhclient-enter-hooks"
+[ -r "$SCRIPT_DIR/bell-admz-boot.sh" ] || die "missing $SCRIPT_DIR/bell-admz-boot.sh"
+[ -r "$SCRIPT_DIR/bell-admz-diag.sh" ] || die "missing $SCRIPT_DIR/bell-admz-diag.sh"
+/bin/sh -n "$SCRIPT_DIR/dhclient-enter-hooks" || die "hook failed sh -n syntax check"
+/bin/sh -n "$SCRIPT_DIR/bell-admz-boot.sh" || die "boot script failed sh -n syntax check"
+/bin/sh -n "$SCRIPT_DIR/bell-admz-diag.sh" || die "diag script failed sh -n syntax check"
+
+if [ "$DRYRUN" = 1 ]; then
+	say "DRY-RUN: would create reference backup under"
+	say "  /root/bell-admz-backup-<ts> (with sha256) of: $DHS, /etc/rc.newwanip,"
+	say "  /usr/local/etc/rc.newwanip, /etc/dhclient.conf, /sbin/dhclient-script (those that exist)"
+	say "DRY-RUN: would install into $CONFDIR:"
+	say "  dhclient-enter-hooks, bell-admz-boot.sh, bell-admz-diag.sh, config"
+	say "DRY-RUN: would install $CONFDIR/bell-admz-boot.sh as /usr/local/etc/rc.d/bell-admz.sh"
+	say "DRY-RUN: would link /etc/dhclient-enter-hooks -> $CONFDIR/dhclient-enter-hooks"
+	say "DRY-RUN: mode=$MODE iface=$IFACE monitors='$MONITORS'"
+	exit 0
+fi
+
+BACKUP="/root/bell-admz-backup-$(date +%Y%m%d-%H%M%S)"
+/bin/mkdir -p "$BACKUP" || die "cannot create $BACKUP"
+for f in "$DHS" /etc/rc.newwanip /usr/local/etc/rc.newwanip /etc/dhclient.conf /sbin/dhclient-script; do
+	cp -p "$f" "$BACKUP/" 2>/dev/null || say "note: $f not present or not copied"
+done
+sha256 "$BACKUP"/* > "$BACKUP/SHA256" 2>/dev/null
+say "reference backup and checksums in $BACKUP"
+
+if [ -e /etc/dhclient-enter-hooks ] || [ -L /etc/dhclient-enter-hooks ]; then
+	CUR=$(/usr/bin/readlink /etc/dhclient-enter-hooks 2>/dev/null || true)
+	[ "$CUR" = "$CONFDIR/dhclient-enter-hooks" ] || \
+		die "/etc/dhclient-enter-hooks exists and is not managed here ('$CUR'); inspect and remove manually"
+fi
+
+/usr/bin/install -d -o root -g wheel -m 700 "$CONFDIR" || die "cannot create $CONFDIR"
+/usr/bin/install -o root -g wheel -m 700 "$SCRIPT_DIR/dhclient-enter-hooks" "$CONFDIR/dhclient-enter-hooks.new" || die "hook install failed"
+/bin/mv "$CONFDIR/dhclient-enter-hooks.new" "$CONFDIR/dhclient-enter-hooks" || die "hook activation failed"
+/usr/bin/install -o root -g wheel -m 700 "$SCRIPT_DIR/bell-admz-boot.sh" "$CONFDIR/bell-admz-boot.sh" || die "boot source install failed"
+/usr/bin/install -o root -g wheel -m 700 "$SCRIPT_DIR/bell-admz-diag.sh" "$CONFDIR/bell-admz-diag.sh" || die "diag install failed"
+
+umask 077
+{
+	printf 'BELL_ADMZ_IFACE=%s\n' "$IFACE"
+	printf 'BELL_ADMZ_MODE=%s\n' "$MODE"
+	printf 'BELL_ADMZ_ENABLED=1\n'
+	[ -n "$MONITORS" ] && printf 'BELL_ADMZ_MONITORS=%s\n' "$MONITORS"
+} > "$CONFDIR/config.tmp" || die "cannot write config"
+/bin/mv "$CONFDIR/config.tmp" "$CONFDIR/config" || die "cannot activate config"
+/usr/sbin/chown root:wheel "$CONFDIR/config"
+/bin/chmod 600 "$CONFDIR/config"
+
+/usr/bin/install -o root -g wheel -m 755 "$CONFDIR/bell-admz-boot.sh" /usr/local/etc/rc.d/bell-admz.sh || die "rc.d install failed"
+/usr/local/etc/rc.d/bell-admz.sh start
+
+say ""
+say "Installed for $IFACE on pfSense $VERSION, mode $MODE."
+say "No interface was reloaded; DHCP keeps running; nothing to roll back yet."
+say "Files: $CONFDIR/{dhclient-enter-hooks,bell-admz-boot.sh,bell-admz-diag.sh,config},"
+say "       /usr/local/etc/rc.d/bell-admz.sh, /etc/dhclient-enter-hooks (symlink)."
+say "State will be learned on the next BOUND (within one 600 s lease cycle)."
+say "Watch:   clog /var/log/system.log | grep 'bell-admz' | tail"
+say "Simulate: $CONFDIR/bell-admz-diag.sh   (and -n for the negative control)"
+say "Switch to retain (after a clean dryrun cycle, with console access):"
+say "  printf 'BELL_ADMZ_IFACE=%s\\nBELL_ADMZ_MODE=retain\\nBELL_ADMZ_ENABLED=1\\nBELL_ADMZ_MONITORS=%s\\n' '$IFACE' '$MONITORS' > $CONFDIR/config.new"
+say "  mv $CONFDIR/config.new $CONFDIR/config"
+say "Disable instantly:  rm -f /etc/dhclient-enter-hooks"
+say "Remove everything:  $SCRIPT_DIR/uninstall-bell-admz.sh"
